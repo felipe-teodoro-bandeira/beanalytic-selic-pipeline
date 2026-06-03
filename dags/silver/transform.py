@@ -17,17 +17,26 @@ _VALOR_MAX = 0.2
 # Max legitimate calendar gap: Christmas + New Year holiday block in Brazil (~10 days)
 _MAX_DATE_GAP_DAYS = 12
 
+# Unparseable rows above this ratio indicate a source data problem, not isolated noise
+_MAX_NULL_RATIO = 0.01
 
-def _validate_bronze(df: pd.DataFrame) -> None:
-    """Quality gate: assert Bronze schema and completeness before transforming."""
+_DAY_NAME_PT = {
+    "Monday": "Segunda",
+    "Tuesday": "Terça",
+    "Wednesday": "Quarta",
+    "Thursday": "Quinta",
+    "Friday": "Sexta",
+    "Saturday": "Sábado",
+    "Sunday": "Domingo",
+}
+
+
+def _validate_schema(df: pd.DataFrame) -> None:
+    """Quality gate: assert Bronze schema before any type conversion."""
     required = {"data", "valor"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Bronze is missing required columns: {missing}")
-
-    null_counts = df[list(required)].isnull().sum()
-    if null_counts.any():
-        logger.warning("Nulls detected in Bronze:\n%s", null_counts[null_counts > 0])
 
 
 def transform_selic() -> int:
@@ -36,10 +45,16 @@ def transform_selic() -> int:
     Transformations applied:
     - 'data': string dd/MM/yyyy  →  datetime64
     - 'valor': string            →  float64 (coerce unparseable → NaN, then drop)
-    - Derived columns: ano, mes, ano_mes, dia_semana
+    - Derived columns: ano, mes, ano_mes, dia_semana (Portuguese)
     - Sort ascending by date
 
-    Quality gate: validates value range and year coverage before saving.
+    Quality gates:
+    - Schema check before type conversion
+    - Null ratio check after type conversion (threshold: 1%)
+    - Value range [0, 0.2]
+    - Year coverage [2020, 2024]
+    - No duplicate dates
+    - No date gap > 12 calendar days
 
     Returns:
         Number of rows saved to Silver.
@@ -51,27 +66,34 @@ def transform_selic() -> int:
     df = pd.read_parquet(bronze_path)
     logger.info("Loaded Bronze: %d rows", len(df))
 
-    _validate_bronze(df)
+    # --- Schema gate (before conversion — catches structural issues early) ---
+    _validate_schema(df)
 
     # --- Type conversions ---
     df["data"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
 
-    # --- Null treatment ---
+    # --- Null ratio gate (after conversion — catches empty strings and bad values) ---
     null_count = df[["data", "valor"]].isnull().sum().sum()
     if null_count > 0:
-        logger.warning("Dropping %d rows with unparseable values", null_count)
+        null_ratio = null_count / len(df)
+        if null_ratio > _MAX_NULL_RATIO:
+            raise ValueError(
+                f"Silver quality gate failed: {null_count} unparseable rows "
+                f"({null_ratio:.1%}) exceeds threshold of {_MAX_NULL_RATIO:.0%}"
+            )
+        logger.warning("Dropping %d rows with unparseable values (%.2f%%)", null_count, null_ratio * 100)
         df = df.dropna(subset=["data", "valor"])
 
     # --- Derived columns ---
     df["ano"] = df["data"].dt.year
     df["mes"] = df["data"].dt.month
     df["ano_mes"] = df["data"].dt.to_period("M").astype(str)
-    df["dia_semana"] = df["data"].dt.day_name()
+    df["dia_semana"] = df["data"].dt.day_name().map(_DAY_NAME_PT)
 
     df = df.sort_values("data").reset_index(drop=True)
 
-    # --- Quality gate ---
+    # --- Quality gates ---
     out_of_range = ~df["valor"].between(_VALOR_MIN, _VALOR_MAX)
     if out_of_range.any():
         raise ValueError(
